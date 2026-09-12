@@ -1,141 +1,17 @@
 #!/usr/bin/env python3
 
-import time
+#builtins
 import argparse
-import posixpath
 import sys
-import unicodedata
 from pathlib import Path
+
+#3rd party libs
 import requests
 
-def normalize_name(name):
-    """
-    Normalize names for deciding whether a match is exact
-    This intentionally does NOT do fuzzy matching, as it matters that the match is exact.
-    Uses casefold and unicodedata.normalize to throughly normalize artist names
-    For example:
-    name = "ＳＴＲＡẞＥ"
+#Local imports
+from lidarr import *
+from utils import *
 
-    name = unicodedata.normalize("NFKC", name)
-    Result: STRAẞE
-
-    name = name.casefold()
-    Result: strasse
-    """
-    name = unicodedata.normalize("NFKC", name) #Normalize the name
-    return " ".join(name.casefold().split()) #Casefold and join to normalize arbitrary whitespace
-
-class Lidarr:
-    def __init__(self, url, api_key):
-        self.url = url.rstrip("/")
-        self.session = requests.Session()
-        self.session.headers.update({
-            "X-Api-Key": api_key,
-            "Content-Type": "application/json"
-        })
-
-        #Cache album lookups because the same album name could
-        #be checked against several artist candidates. E.g. "Greatest hits"
-        self.album_lookup_cache = {}
-
-    def get(self, endpoint, params=None):
-        url = f"{self.url}/api/v1/{endpoint}"
-        
-        for attempt in range(3):
-            response = self.session.get(
-                url,
-                params=params,
-                timeout=30
-            )
-
-            if response.status_code == 503 and attempt < 2:
-                print(
-                    "Server unavailable: retrying "
-                    f"({attempt + 1}/3)"
-                )
-
-            #Throw an error if we get a bad HTTP status
-            response.raise_for_status()
-            return response.json()
-
-    def post(self, endpoint, payload):
-        #Call self.session.post to perform a POST request
-        response = self.session.post(
-            f"{self.url}/api/v1/{endpoint}",
-            json=payload,
-            timeout=60
-        )
-        #Throw an error if we get a bad HTTP status
-        response.raise_for_status()
-        return response.json()
-
-    def lookup_artist(self, name):
-        #Do a GET request on the artist/lookup endpoint to lookup an artist
-        return self.get("artist/lookup", {"term": name})
-
-    def lookup_album(self, name):
-        """
-        Look up an album by title
-        Cache results since there may be album collisions between artists. E.g. "Greatest hits"
-        """
-        key = normalize_name(name)
-
-        if key not in self.album_lookup_cache:
-            time.sleep(0.25)
-            self.album_lookup_cache[key] = self.get(
-                "album/lookup",
-                {"term": name}
-            )
-
-        return self.album_lookup_cache[key]
-
-    def get_existing_artists(self):
-        #Do a GET request on the artist endpoint to get existing artists
-        return self.get("artist")
-
-    def get_quality_profiles(self):
-        return self.get("qualityprofile")
-
-    def get_metadata_profiles(self):
-        return self.get("metadataprofile")
-
-    def search(self, term):
-        #Do a GET request on the search endpoint
-        return self.get("search", {"term":term})
-
-    def add_artist(self, 
-        candidate, 
-        artist_folder_name,
-        root_folder, 
-        quality_profile_id, 
-        metadata_profile_id
-    ):
-        """
-        Add an artist to the Lidarr library by doing a POST request
-        Params: 
-            candidate: A dictionary of artist data
-            root_folder: The path to the root folder of the music library
-            quality_profile_id: The ID of the desired quality profile
-            metadata_profile_id: The 
-        """
-        artist_path = posixpath.join(
-            root_folder.rstrip("/"),
-            artist_folder_name
-        )
-
-        payload = {
-                "artistName": candidate["artistName"],
-                "foreignArtistId": candidate["foreignArtistId"],
-                "qualityProfileId": quality_profile_id,
-                "metadataProfileId": metadata_profile_id,
-                "path": artist_path,
-                "monitored": False,
-                "addOptions": {
-                    "monitor": "none",
-                    "searchForMissingAlbums": False
-                }
-        }
-        return self.post("artist", payload)
 
 def discover_artist_folders(music_dir):
     """
@@ -266,7 +142,7 @@ def score_candidate_by_albums(lidarr, local_albums, candidate):
         return {
             "match_count": 0,
             "local_count": len(local_albums),
-            "matched_albums": []
+            "matched_albums": [],
         }
 
     for local_album in local_albums:
@@ -280,22 +156,19 @@ def score_candidate_by_albums(lidarr, local_albums, candidate):
         local_normalized = normalize_name(local_album)
 
         for album in results:
-            #Skip the current album candidate if the normalized names don't match
-            if normalize_name(album.get("title", "")) != local_normalized:
-                continue
-
-            #Skip the current album candidate if the IDs don't match
             if album_result_artist_id(album) != candidate_id:
                 continue
 
-            #Only add the candidate album to matched_albums if both the name and ID match
-            matched_albums.append(local_album)
-            break
-    
+            title = album.get("title")
+
+            if normalize_name(title or "") == local_normalized:
+                matched_albums.append(local_album)
+                break
+                
     return {
         "match_count": len(matched_albums),
         "local_count": len(local_albums),
-        "matched_albums": matched_albums
+        "matched_albums": matched_albums,
     }
 
 def score_candidates(lidarr, artist_folder, candidates):
@@ -317,7 +190,7 @@ def score_candidates(lidarr, artist_folder, candidates):
             "candidate":candidate,
             "album_match_count": album_score["match_count"],
             "local_album_count": album_score["local_count"],
-            "matched_albums": album_score["matched_albums"]
+            "matched_albums": album_score["matched_albums"],
         })
 
     #Most album matches first
@@ -398,19 +271,39 @@ def choose_candidate(folder_name, candidates):
         return None
 
     #Show the candidates for the current folder name
-    for i, candidate in enumerate(candidates, start=1):
+    displayed_candidates = candidates[:4] #Display the first 4 candidates
+    candidates_not_displayed = candidates[4:] #Reserve the rest for optional display
+    for i, candidate in enumerate(displayed_candidates, start=1):
         display_candidate(i, candidate)
 
     print()
     print("\t[s] Skip this artist")
+    print("\t[m] Display more candidates")
+
+    display_more_flag = False
 
     #Loop on the input so that if a bad selection is made
     #the user will be prompted again
     while True:
-        choice = input("Choose candidate: ").strip().lower()
+        if not display_more_flag:
+            choice = input(
+                f"Choose candidate: [1-{len(displayed_candidates)}]"
+            ).strip().lower()
+        else:
+            choice = input(
+                f"Choose candidate: [{1-{len(candidates)}}]"
+            )
 
+        #Skip this candidate
         if choice == "s":
             return None
+
+        #Display more candidates
+        if choice == "m":
+            for i, candidate in enumerate(candidates_not_displayed, start=1):
+                display_candidate(i+len(displayed_candidates), candidate)
+            display_more_flag = True
+            continue
 
         #Perform validation on the user's input
         try:
@@ -419,6 +312,7 @@ def choose_candidate(folder_name, candidates):
             print("Enter a candidate number or 's'.")
             continue
 
+        #Select based off candidates here, since we may display more candidates
         if 0 <= index < len(candidates):
             return candidates[index]
 
@@ -642,8 +536,8 @@ def build_plan(
             print()
             print(item["folder"].name)
 
-            #Only show the first five candidates
-            for index, scored_candidate in enumerate(item["candidates"][:5], start=1):
+            #Only show the first four candidates
+            for index, scored_candidate in enumerate(item["candidates"][:4], start=1):
                 display_candidate(index, scored_candidate)
 
         
