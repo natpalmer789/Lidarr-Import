@@ -42,7 +42,7 @@ class Lidarr:
         url = f"{self.url}/api/v1/{endpoint}"
         
         for attempt in range(3):
-            response = requests.get(
+            response = self.session.get(
                 url,
                 params=params,
                 timeout=30
@@ -81,6 +81,7 @@ class Lidarr:
         key = normalize_name(name)
 
         if key not in self.album_lookup_cache:
+            time.sleep(0.25)
             self.album_lookup_cache[key] = self.get(
                 "album/lookup",
                 {"term": name}
