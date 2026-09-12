@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import time
 import argparse
 import posixpath
 import sys
@@ -38,15 +39,24 @@ class Lidarr:
         self.album_lookup_cache = {}
 
     def get(self, endpoint, params=None):
-        #Call self.session.get to perform a GET request
-        response = self.session.get(
-            f"{self.url}/api/v1/{endpoint}",
-            params=params,
-            timeout=60
-        )
-        #Throw an error if we get a bad HTTP status
-        response.raise_for_status()
-        return response.json()
+        url = f"{self.url}/api/v1/{endpoint}"
+        
+        for attempt in range(3):
+            response = requests.get(
+                url,
+                params=params,
+                timeout=30
+            )
+
+            if response.status_code == 503 and attempt < 2:
+                print(
+                    "Server unavailable: retrying "
+                    f"({attempt + 1}/3)"
+                )
+
+            #Throw an error if we get a bad HTTP status
+            response.raise_for_status()
+            return response.json()
 
     def post(self, endpoint, payload):
         #Call self.session.post to perform a POST request
@@ -136,10 +146,19 @@ def discover_artist_folders(music_dir):
     if not root.is_dir():
         raise RuntimeError(f"Music directory does not exist: {root}")
 
+    excluded_folders = {
+        "aurral-weekly-flow"
+    }
+
     folders = []
     for directory in root.iterdir():
-        if directory.is_dir():
-            folders.append(directory)
+        if not directory.is_dir():
+            continue
+
+        if directory.name.casefold() in excluded_folders:
+            continue
+
+        folders.append(directory)
 
     return sorted(
             folders,
