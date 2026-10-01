@@ -11,6 +11,7 @@ import requests
 #Local imports
 from lidarr import *
 from utils import *
+from listenbrainz import *
 
 
 def discover_artist_folders(music_dir):
@@ -43,6 +44,9 @@ def discover_artist_folders(music_dir):
     )
 
 def discover_album_folders(artist_folder):
+    """
+    Returns a list of album folders given an artist folder
+    """
     albums = []
 
     for directory in artist_folder.iterdir():
@@ -229,6 +233,36 @@ def automatic_album_candidate(scored_candidates):
 
     return best
 
+def add_popular_albums(listenbrainz, candidates):
+    """
+    Query ListenBrainz for popular albums for candidates that 
+    are about to be displayed
+    """
+    for scored_candidate in candidates:
+        candidate = scored_candidate["candidate"]
+        artist_mbid = candidate.get("foreignArtistId")
+
+        if not artist_mbid:
+            scored_candidate["popular_albums"] = []
+            scored_candidate["popular_albums_failed"] = False
+            continue
+
+        try:
+            scored_candidate["popular_albums"] = (
+                listenbrainz.get_popular_albums(artist_mbid)
+            )
+            scored_candidate["popular_albums_failed"] = False
+
+        except requests.RequestException as e:
+            scored_candidate["popular_albums"] = []
+            scored_candidate["popular_albums_failed"] = True
+            print(
+                f"\tListenBrainz lookup failed for "
+                f"{candidate.get('artistName', '<unknown>')}: {e}"
+            )
+
+
+
 def display_candidate(number, scored_candidate):
     """
     Display an artist candidate plus its album-match evidence
@@ -247,6 +281,9 @@ def display_candidate(number, scored_candidate):
 
     matched_albums = scored_candidate["matched_albums"]
 
+    popular_albums = scored_candidate.get("popular_albums", [])
+    popular_albums_failed = scored_candidate.get("popular_albums_failed", False)
+
     #Print info about the candidate
     print(f"[{number}] {artist_name}")
     print(f"\tMBID: {mbid}")
@@ -255,7 +292,18 @@ def display_candidate(number, scored_candidate):
     if matched_albums:
         print(f"\tMatching albums: {', '.join(matched_albums)}")
 
-def choose_candidate(folder_name, candidates):
+    if popular_albums_failed:
+        print("\tPopular albums: <lookup failed>")
+    elif popular_albums:
+        print(
+            f"\tPopular albums: "
+            f"{', '.join(popular_albums)}"
+        )
+    else:
+        print("\tPopular albums: <none found>")
+
+
+def choose_candidate(folder_name, candidates, listenbrainz):
     """
     Show the user artist candidates for folder_name
     and prompt them to select an artist.
@@ -273,6 +321,9 @@ def choose_candidate(folder_name, candidates):
     #Show the candidates for the current folder name
     displayed_candidates = candidates[:4] #Display the first 4 candidates
     candidates_not_displayed = candidates[4:] #Reserve the rest for optional display
+
+    add_popular_albums(listenbrainz, displayed_candidates)
+
     for i, candidate in enumerate(displayed_candidates, start=1):
         display_candidate(i, candidate)
 
@@ -291,8 +342,8 @@ def choose_candidate(folder_name, candidates):
             ).strip().lower()
         else:
             choice = input(
-                f"Choose candidate: [{1-{len(candidates)}}]"
-            )
+                f"Choose candidate: [1-{len(candidates)}]"
+            ).strip().lower()
 
         #Skip this candidate
         if choice == "s":
@@ -300,6 +351,7 @@ def choose_candidate(folder_name, candidates):
 
         #Display more candidates
         if choice == "m":
+            add_popular_albums(listenbrainz, candidates_not_displayed)
             for i, candidate in enumerate(candidates_not_displayed, start=1):
                 display_candidate(i+len(displayed_candidates), candidate)
             display_more_flag = True
@@ -309,7 +361,7 @@ def choose_candidate(folder_name, candidates):
         try:
             index = int(choice) - 1
         except ValueError:
-            print("Enter a candidate number or 's'.")
+            print("Enter a candidate number 's' or 'm'.")
             continue
 
         #Select based off candidates here, since we may display more candidates
@@ -319,6 +371,9 @@ def choose_candidate(folder_name, candidates):
         print("Invalid selection!")
 
 def show_plan(plan, unresolved, quality_profile, metadata_profile):
+    """
+    Prints the current Lidarr import plan
+    """
     print()
     print("=" * 60)
     print("FINAL IMPORT PLAN")
@@ -379,6 +434,7 @@ def show_plan(plan, unresolved, quality_profile, metadata_profile):
 
 def build_plan(
         lidarr,
+        listenbrainz,
         artist_folders,
         existing_artist_ids,
         preview
@@ -536,8 +592,12 @@ def build_plan(
             print()
             print(item["folder"].name)
 
+            displayed_candidates = item["candidates"][:4]
+
+            add_popular_albums(listenbrainz, displayed_candidates)
+
             #Only show the first four candidates
-            for index, scored_candidate in enumerate(item["candidates"][:4], start=1):
+            for index, scored_candidate in enumerate(displayed_candidates, start=1):
                 display_candidate(index, scored_candidate)
 
         
@@ -557,7 +617,7 @@ def build_plan(
     
     #Now resolve every ambiguous artist
     for item in manual_needed:
-        selected = choose_candidate(item["folder"].name, item["candidates"])
+        selected = choose_candidate(item["folder"].name, item["candidates"], listenbrainz)
 
         if selected is None:
             unresolved.append(item["folder"])
@@ -581,6 +641,9 @@ def build_plan(
     return plan, unresolved
 
 def parse_args():
+    """
+    Parses arguments
+    """
     parser = argparse.ArgumentParser(description="Import existing artist folders into Lidarr using its API")
 
     parser.add_argument("--api-key", required=True, help="Lidarr API key")
@@ -594,8 +657,14 @@ def parse_args():
 def main():
     args = parse_args()
 
+    #Create the lidarr object
     lidarr = Lidarr(args.lidarr_url, args.api_key)
 
+    #Listenbrainz instance
+    listenbrainz = ListenBrainz()
+
+    #Get data needed to build the plan from Lidarr
+    #also discover artist folders and find existing artists
     try:
         quality_profiles = lidarr.get_quality_profiles()
 
@@ -619,23 +688,31 @@ def main():
         f"{len(existing_artists)} artists."
     )
 
+    #Prompt the user to select a quality and metadata profile
     quality_profile = select_profile(quality_profiles, "quality")
 
     metadata_profile = select_profile(metadata_profiles, "metadata")
 
+    #Get the ids of the existing artists
     existing_artist_ids = {
         artist.get("foreignArtistId")
         for artist in existing_artists
         if artist.get("foreignArtistId")
     }
 
-    plan, unresolved = build_plan(lidarr, artist_folders, existing_artist_ids, args.preview)
+    #Build the import plan
+    #Note: If the user passed the --preview argument this won't prompt the user to select anything
+    #      but if the --preview arg wasn't passed it'll prompt the user to select an artist for each
+    #      insufficient artist match.
+    plan, unresolved = build_plan(lidarr, listenbrainz, artist_folders, existing_artist_ids, args.preview)
 
+    #Exit early if the user passed --preview
     if args.preview:
         print()
         print("Preview complete. No changes were made.")
         return 0
 
+    #Show the plan to the user
     show_plan(plan, unresolved, quality_profile, metadata_profile)
 
     if not plan:
@@ -644,6 +721,7 @@ def main():
 
     print()
 
+    #Confirm with the user BEFORE changing anything in Lidarr
     confirmation = input("Type 'yes' to import ALL artists shown above: ")
 
     if confirmation.lower() != "yes":
@@ -655,8 +733,10 @@ def main():
     print("IMPORTING TO LIDARR!!!")
     print("=" * 60)
 
+    #Track import failures
     failures = []
 
+    #Now attempt to implement the import plan by doing POSTs to Lidarr
     for index, item in enumerate(plan, start=1):
         candidate = item["candidate"]
 
@@ -665,6 +745,7 @@ def main():
             f"Adding {candidate['artistName']}..."
         )
 
+        #Add the item in the plan to Lidarr
         try:
             lidarr.add_artist(candidate, item["folder"].name, args.root_folder, quality_profile["id"], metadata_profile["id"])
         except requests.RequestException as exc:
@@ -674,6 +755,7 @@ def main():
         else:
             print("\tAdded!")
 
+    #Print stats about the import performed
     print()
     print("=" * 60)
     print("LIDARR IMPORT COMPLETE")
@@ -682,6 +764,7 @@ def main():
     print(f"Successfully submitted: {len(plan) - len(failures)}")
     print(f"Failed: {len(failures)}")
 
+    #Report any unresolved
     if unresolved:
         print()
         print("Artists not imported because no selection was made: ")
@@ -689,6 +772,7 @@ def main():
         for folder in unresolved:
             print(f"\t{folder.name}")
 
+    #Report any failures
     if failures:
         print()
         print("Artists that failed during API import: ")
